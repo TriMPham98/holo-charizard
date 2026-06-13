@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 
+import bmesh
 import bpy
 from mathutils import Vector
 
@@ -23,6 +24,8 @@ BLEND_PATH = os.path.join(PROJECT_ROOT, "holo_charizard.blend")
 CARD_WIDTH = 6.3
 CARD_HEIGHT = 8.8
 CARD_THICKNESS = 0.032
+CARD_CORNER_RADIUS = 0.32  # ~3.2 mm on a 63 mm-wide TCG card
+CARD_CORNER_SEGMENTS = 12
 CARD_LEAN_DEG = 10.0  # slight backward lean from vertical
 
 # Holo art window (normalized UV bounds — classic card layout)
@@ -299,15 +302,36 @@ def create_card_material(rainbow_img, dist_img, face_img, cosmos_img):
 # ---------------------------------------------------------------------------
 # Geometry
 # ---------------------------------------------------------------------------
-def assign_card_uvs(mesh):
+def rounded_rect_points(half_w, half_h, radius, segments):
+    """CCW outline of a rounded rectangle centered on the origin."""
+    r = min(radius, half_w - 1e-6, half_h - 1e-6)
+    corners = (
+        (-half_w + r, -half_h + r, math.pi, 1.5 * math.pi),
+        (half_w - r, -half_h + r, 1.5 * math.pi, 2.0 * math.pi),
+        (half_w - r, half_h - r, 0.0, 0.5 * math.pi),
+        (-half_w + r, half_h - r, 0.5 * math.pi, math.pi),
+    )
+    points = []
+    for cx, cy, angle_start, angle_end in corners:
+        for i in range(segments):
+            angle = angle_start + (angle_end - angle_start) * (i / segments)
+            points.append((cx + r * math.cos(angle), cy + r * math.sin(angle)))
+    return points
+
+
+def assign_card_uvs(mesh, half_w=None, half_h=None):
     if not mesh.uv_layers:
         mesh.uv_layers.new(name="UVMap")
     uv_layer = mesh.uv_layers.active.data
     verts = mesh.vertices
-    min_x = min(v.co.x for v in verts)
-    max_x = max(v.co.x for v in verts)
-    min_y = min(v.co.y for v in verts)
-    max_y = max(v.co.y for v in verts)
+    if half_w is not None and half_h is not None:
+        min_x, max_x = -half_w, half_w
+        min_y, max_y = -half_h, half_h
+    else:
+        min_x = min(v.co.x for v in verts)
+        max_x = max(v.co.x for v in verts)
+        min_y = min(v.co.y for v in verts)
+        max_y = max(v.co.y for v in verts)
     span_x = max(max_x - min_x, 1e-6)
     span_y = max(max_y - min_y, 1e-6)
     for loop in mesh.loops:
@@ -318,16 +342,39 @@ def assign_card_uvs(mesh):
 
 
 def create_card_mesh(material):
-    bpy.ops.mesh.primitive_plane_add(size=1.0, location=(0, 0, CARD_THICKNESS / 2))
-    card = bpy.context.active_object
-    card.name = "HoloCharizardCard"
-    card.scale = (CARD_WIDTH, CARD_HEIGHT, 1.0)
-    bpy.ops.object.transform_apply(scale=True)
-    assign_card_uvs(card.data)
+    half_w = CARD_WIDTH / 2
+    half_h = CARD_HEIGHT / 2
+    z = CARD_THICKNESS / 2
+
+    bm = bmesh.new()
+    outline = rounded_rect_points(
+        half_w, half_h, CARD_CORNER_RADIUS, CARD_CORNER_SEGMENTS
+    )
+    verts = [bm.verts.new((x, y, z)) for x, y in outline]
+    bm.verts.ensure_lookup_table()
+    bm.faces.new(verts)
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+
+    mesh = bpy.data.meshes.new("HoloCharizardCardMesh")
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
+
+    card = bpy.data.objects.new("HoloCharizardCard", mesh)
+    bpy.context.collection.objects.link(card)
+    bpy.context.view_layer.objects.active = card
+    card.select_set(True)
+    assign_card_uvs(mesh, half_w, half_h)
 
     solidify = card.modifiers.new("Solidify", "SOLIDIFY")
     solidify.thickness = CARD_THICKNESS
     solidify.offset = 0.0
+
+    bevel = card.modifiers.new("Bevel", "BEVEL")
+    bevel.width = min(CARD_CORNER_RADIUS * 0.12, CARD_THICKNESS * 0.45)
+    bevel.segments = 2
+    bevel.limit_method = "ANGLE"
+    bevel.angle_limit = math.radians(35)
 
     card.data.materials.append(material)
     return card
