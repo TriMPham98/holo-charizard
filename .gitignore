@@ -1,0 +1,16 @@
+# Blender backups
+*.blend1
+
+# Python
+__pycache__/
+*.pyc
+
+# Debug / test renders
+debug_*.png
+test_*.png
+render_preview.png
+user_screenshot*.png
+assets/textures/test_write.png
+
+# macOS
+.DS_Store
