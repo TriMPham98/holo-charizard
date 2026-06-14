@@ -13,6 +13,12 @@ import bmesh
 import bpy
 from mathutils import Vector
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+from blender_render_utils import configure_eevee_render
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -33,6 +39,16 @@ HOLO_UV_X_MIN = 0.08
 HOLO_UV_X_MAX = 0.92
 HOLO_UV_Y_MIN = 0.36
 HOLO_UV_Y_MAX = 0.78
+
+# Holo shader tuning (exposed for easy adjustment)
+HOLO_MASK_FEATHER = 0.006
+HOLO_MASK_POWER = 0.65
+HOLO_FOIL_BOTTOM_RAINBOW = 0.92
+HOLO_FOIL_BASE_SCREEN = 0.82
+HOLO_FOIL_MID_LIGHTEN = 0.88
+HOLO_GLARE_MIX = 0.55
+HOLO_EMISSION_STRENGTH = 1.35
+HOLO_FRESNEL_BLEND = 0.12
 
 
 # ---------------------------------------------------------------------------
@@ -77,13 +93,23 @@ def generate_texture_files():
     )
 
 
-def load_image(name, colorspace="sRGB", extensions=(".png", ".jpg", ".jpeg")):
-    path = None
+def _texture_path(name, extensions=(".png", ".jpg", ".jpeg")):
     for ext in extensions:
         candidate = os.path.join(ASSETS_DIR, f"{name}{ext}")
         if os.path.isfile(candidate):
-            path = candidate
-            break
+            return candidate
+    return None
+
+
+def _ensure_image_loaded(img):
+    if len(img.pixels) == 0:
+        img.reload()
+    elif img.pixels[0] == 0.0:
+        img.reload()
+
+
+def load_image(name, colorspace="sRGB", extensions=(".png", ".jpg", ".jpeg")):
+    path = _texture_path(name, extensions)
     if path is None:
         raise FileNotFoundError(f"Missing texture {name} in {ASSETS_DIR}")
 
@@ -95,20 +121,85 @@ def load_image(name, colorspace="sRGB", extensions=(".png", ".jpg", ".jpeg")):
     img.colorspace_settings.name = colorspace
     img.filepath = path
     img.reload()
-    if len(img.pixels) > 0 and img.pixels[0] == 0.0:
-        img.reload()
+    _ensure_image_loaded(img)
     if len(img.pixels) > 0 and sum(img.pixels[:12]) > 0.0:
         img.pack()
     return img
 
 
+def load_image_optional(name, fallback_name, colorspace="sRGB", extensions=(".png", ".jpg", ".jpeg")):
+    path = _texture_path(name, extensions)
+    if path is None:
+        print(
+            f"WARNING: Missing texture {name} in {ASSETS_DIR}; "
+            f"falling back to {fallback_name}."
+        )
+        existing = bpy.data.images.get(fallback_name)
+        if existing is not None:
+            _ensure_image_loaded(existing)
+            return existing
+        return load_image(fallback_name, colorspace, extensions)
+    return load_image(name, colorspace, extensions)
+
+
 # ---------------------------------------------------------------------------
 # Material
 # ---------------------------------------------------------------------------
-def create_card_material(rainbow_img, dist_img, face_img, cosmos_img):
-    for img in (face_img, rainbow_img, dist_img, cosmos_img):
-        if img.pixels[0] == 0.0:
-            img.reload()
+def _add_axis_mask(nodes, links, uv_component, uv_min, uv_max, location):
+    """Rectangular mask: 0 outside [min, max], 1 inside, feathered edges."""
+    rise = nodes.new("ShaderNodeMapRange")
+    rise.location = location
+    rise.clamp = True
+    rise.inputs["From Min"].default_value = uv_min
+    rise.inputs["From Max"].default_value = uv_min + HOLO_MASK_FEATHER
+    rise.inputs["To Min"].default_value = 0.0
+    rise.inputs["To Max"].default_value = 1.0
+
+    fall = nodes.new("ShaderNodeMapRange")
+    fall.location = (location[0] + 200, location[1])
+    fall.clamp = True
+    fall.inputs["From Min"].default_value = uv_max - HOLO_MASK_FEATHER
+    fall.inputs["From Max"].default_value = uv_max
+    fall.inputs["To Min"].default_value = 1.0
+    fall.inputs["To Max"].default_value = 0.0
+
+    combined = nodes.new("ShaderNodeMath")
+    combined.location = (location[0] + 400, location[1])
+    combined.operation = "MULTIPLY"
+
+    links.new(uv_component, rise.inputs["Value"])
+    links.new(uv_component, fall.inputs["Value"])
+    links.new(rise.outputs["Result"], combined.inputs[0])
+    links.new(fall.outputs["Result"], combined.inputs[1])
+    return combined
+
+
+def _add_uv_offset(nodes, links, base_uv, offset_x, offset_y, location):
+    """Shift a UV vector by view-dependent X/Y offsets."""
+    sep = nodes.new("ShaderNodeSeparateXYZ")
+    sep.location = location
+    combine = nodes.new("ShaderNodeCombineXYZ")
+    combine.location = (location[0] + 180, location[1])
+    add_x = nodes.new("ShaderNodeMath")
+    add_x.location = (location[0] + 60, location[1] + 40)
+    add_x.operation = "ADD"
+    add_y = nodes.new("ShaderNodeMath")
+    add_y.location = (location[0] + 60, location[1] - 40)
+    add_y.operation = "ADD"
+    links.new(base_uv, sep.inputs["Vector"])
+    links.new(sep.outputs["X"], add_x.inputs[0])
+    links.new(offset_x, add_x.inputs[1])
+    links.new(sep.outputs["Y"], add_y.inputs[0])
+    links.new(offset_y, add_y.inputs[1])
+    links.new(add_x.outputs["Value"], combine.inputs["X"])
+    links.new(add_y.outputs["Value"], combine.inputs["Y"])
+    links.new(sep.outputs["Z"], combine.inputs["Z"])
+    return combine
+
+
+def create_card_material(rainbow_img, dist_img, face_img, cosmos_bottom_img, cosmos_middle_img):
+    for img in (face_img, rainbow_img, dist_img, cosmos_bottom_img, cosmos_middle_img):
+        _ensure_image_loaded(img)
 
     mat = bpy.data.materials.new("HoloCharizardCard")
     mat.use_nodes = True
@@ -119,147 +210,248 @@ def create_card_material(rainbow_img, dist_img, face_img, cosmos_img):
     nodes.clear()
 
     output = nodes.new("ShaderNodeOutputMaterial")
-    output.location = (900, 0)
+    output.location = (1300, 0)
 
     tex_coord = nodes.new("ShaderNodeTexCoord")
-    tex_coord.location = (-1000, 200)
+    tex_coord.location = (-1200, 200)
 
     face_tex = nodes.new("ShaderNodeTexImage")
-    face_tex.location = (-750, 300)
+    face_tex.location = (-900, 360)
     face_tex.image = face_img
     face_tex.interpolation = "Linear"
 
     principled = nodes.new("ShaderNodeBsdfPrincipled")
-    principled.location = (-200, 300)
+    principled.location = (500, 360)
     principled.inputs["Base Color"].default_value = (0.95, 0.78, 0.12, 1.0)
-    principled.inputs["Roughness"].default_value = 0.22
+    principled.inputs["Roughness"].default_value = 0.18
     if "Specular IOR Level" in principled.inputs:
-        principled.inputs["Specular IOR Level"].default_value = 0.55
+        principled.inputs["Specular IOR Level"].default_value = 0.65
 
     layer = nodes.new("ShaderNodeLayerWeight")
-    layer.location = (-1000, 0)
-    layer.inputs["Blend"].default_value = 0.15
+    layer.location = (-1200, 40)
+    layer.inputs["Blend"].default_value = HOLO_FRESNEL_BLEND
 
     geom = nodes.new("ShaderNodeNewGeometry")
-    geom.location = (-1000, -200)
+    geom.location = (-1200, -180)
 
     view_neg = nodes.new("ShaderNodeVectorMath")
-    view_neg.location = (-1000, -350)
+    view_neg.location = (-1200, -360)
     view_neg.operation = "MULTIPLY"
-    view_neg.inputs[1].default_value = (-6.0, -6.0, 0.0)
+    view_neg.inputs[1].default_value = (-8.0, -8.0, 0.0)
 
     sep_view = nodes.new("ShaderNodeSeparateXYZ")
-    sep_view.location = (-800, -350)
+    sep_view.location = (-1000, -360)
 
     sep_obj = nodes.new("ShaderNodeSeparateXYZ")
-    sep_obj.location = (-800, -500)
+    sep_obj.location = (-1000, -520)
 
     dist_tex = nodes.new("ShaderNodeTexImage")
-    dist_tex.location = (-800, -650)
+    dist_tex.location = (-1000, -700)
     dist_tex.image = dist_img
     dist_tex.extension = "REPEAT"
 
     sep_dist = nodes.new("ShaderNodeSeparateColor")
-    sep_dist.location = (-600, -650)
+    sep_dist.location = (-800, -700)
     sep_dist.mode = "RGB"
 
     add_x = nodes.new("ShaderNodeMath")
-    add_x.location = (-600, -350)
+    add_x.location = (-800, -360)
     add_x.operation = "ADD"
 
     add_y = nodes.new("ShaderNodeMath")
-    add_y.location = (-600, -450)
+    add_y.location = (-800, -460)
     add_y.operation = "ADD"
 
+    dist_x = nodes.new("ShaderNodeMath")
+    dist_x.location = (-800, -580)
+    dist_x.operation = "MULTIPLY"
+    dist_x.inputs[1].default_value = 0.35
+
+    dist_y = nodes.new("ShaderNodeMath")
+    dist_y.location = (-800, -640)
+    dist_y.operation = "MULTIPLY"
+    dist_y.inputs[1].default_value = 0.35
+
     foil_x = nodes.new("ShaderNodeMath")
-    foil_x.location = (-400, -350)
+    foil_x.location = (-650, -360)
     foil_x.operation = "ADD"
 
     foil_y = nodes.new("ShaderNodeMath")
-    foil_y.location = (-400, -450)
+    foil_y.location = (-650, -460)
     foil_y.operation = "ADD"
 
-    dist_x = nodes.new("ShaderNodeMath")
-    dist_x.location = (-600, -530)
-    dist_x.operation = "MULTIPLY"
-    dist_x.inputs[1].default_value = 0.25
+    def make_offset(scale, y_bias, loc):
+        ox = nodes.new("ShaderNodeMath")
+        ox.location = loc
+        ox.operation = "MULTIPLY"
+        ox.inputs[1].default_value = scale
+        oy = nodes.new("ShaderNodeMath")
+        oy.location = (loc[0], loc[1] - 80)
+        oy.operation = "MULTIPLY"
+        oy.inputs[1].default_value = scale
+        oy_bias = nodes.new("ShaderNodeMath")
+        oy_bias.location = (loc[0] + 180, loc[1] - 80)
+        oy_bias.operation = "ADD"
+        oy_bias.inputs[1].default_value = y_bias
+        links.new(foil_x.outputs["Value"], ox.inputs[0])
+        links.new(foil_y.outputs["Value"], oy.inputs[0])
+        links.new(oy.outputs["Value"], oy_bias.inputs[0])
+        return ox, oy_bias
 
-    dist_y = nodes.new("ShaderNodeMath")
-    dist_y.location = (-600, -610)
-    dist_y.operation = "MULTIPLY"
-    dist_y.inputs[1].default_value = 0.25
+    rainbow_off_x, rainbow_off_y = make_offset(0.42, 0.08, (-600, -360))
+    middle_off_x, middle_off_y = make_offset(0.28, 0.05, (-600, -520))
+    bottom_off_x, bottom_off_y = make_offset(0.18, 0.03, (-600, -680))
 
-    combine_uv = nodes.new("ShaderNodeCombineXYZ")
-    combine_uv.location = (-200, -400)
+    rainbow_uv = _add_uv_offset(
+        nodes, links, tex_coord.outputs["UV"], rainbow_off_x.outputs["Value"],
+        rainbow_off_y.outputs["Value"], (-350, -360),
+    )
+    middle_uv = _add_uv_offset(
+        nodes, links, tex_coord.outputs["UV"], middle_off_x.outputs["Value"],
+        middle_off_y.outputs["Value"], (-350, -520),
+    )
+    bottom_uv = _add_uv_offset(
+        nodes, links, tex_coord.outputs["UV"], bottom_off_x.outputs["Value"],
+        bottom_off_y.outputs["Value"], (-350, -680),
+    )
 
     rainbow_tex = nodes.new("ShaderNodeTexImage")
-    rainbow_tex.location = (0, -400)
+    rainbow_tex.location = (-80, -360)
     rainbow_tex.image = rainbow_img
     rainbow_tex.extension = "REPEAT"
 
-    cosmos_tex = nodes.new("ShaderNodeTexImage")
-    cosmos_tex.location = (-750, 80)
-    cosmos_tex.image = cosmos_img
-    cosmos_tex.interpolation = "Linear"
+    cosmos_bottom_tex = nodes.new("ShaderNodeTexImage")
+    cosmos_bottom_tex.location = (-80, -680)
+    cosmos_bottom_tex.image = cosmos_bottom_img
+    cosmos_bottom_tex.interpolation = "Linear"
+    cosmos_bottom_tex.extension = "CLIP"
 
-    foil_mix = nodes.new("ShaderNodeMix")
-    foil_mix.location = (100, -250)
-    foil_mix.data_type = "RGBA"
-    foil_mix.blend_type = "SCREEN"
-    foil_mix.inputs["Factor"].default_value = 0.65
+    cosmos_middle_tex = nodes.new("ShaderNodeTexImage")
+    cosmos_middle_tex.location = (-80, -520)
+    cosmos_middle_tex.image = cosmos_middle_img
+    cosmos_middle_tex.interpolation = "Linear"
+    cosmos_middle_tex.extension = "CLIP"
 
-    holo_screen = nodes.new("ShaderNodeMix")
-    holo_screen.location = (200, 100)
-    holo_screen.data_type = "RGBA"
-    holo_screen.blend_type = "SCREEN"
-    holo_screen.inputs["Factor"].default_value = 0.75
+    bottom_rainbow = nodes.new("ShaderNodeMix")
+    bottom_rainbow.location = (180, -520)
+    bottom_rainbow.data_type = "RGBA"
+    bottom_rainbow.blend_type = "MULTIPLY"
+    bottom_rainbow.inputs["Factor"].default_value = HOLO_FOIL_BOTTOM_RAINBOW
+
+    foil_base = nodes.new("ShaderNodeMix")
+    foil_base.location = (380, -420)
+    foil_base.data_type = "RGBA"
+    foil_base.blend_type = "SCREEN"
+    foil_base.inputs["Factor"].default_value = HOLO_FOIL_BASE_SCREEN
+
+    foil_mid = nodes.new("ShaderNodeMix")
+    foil_mid.location = (580, -300)
+    foil_mid.data_type = "RGBA"
+    foil_mid.blend_type = "LIGHTEN"
+    foil_mid.inputs["Factor"].default_value = HOLO_FOIL_MID_LIGHTEN
 
     sep_uv = nodes.new("ShaderNodeSeparateXYZ")
-    sep_uv.location = (-750, 500)
-
-    mask_x = nodes.new("ShaderNodeMapRange")
-    mask_x.location = (-550, 600)
-    mask_x.clamp = True
-    mask_x.inputs["From Min"].default_value = HOLO_UV_X_MIN
-    mask_x.inputs["From Max"].default_value = HOLO_UV_X_MAX
-
-    mask_y = nodes.new("ShaderNodeMapRange")
-    mask_y.location = (-550, 450)
-    mask_y.clamp = True
-    mask_y.inputs["From Min"].default_value = HOLO_UV_Y_MIN
-    mask_y.inputs["From Max"].default_value = HOLO_UV_Y_MAX
+    sep_uv.location = (-900, 560)
 
     mask_mul = nodes.new("ShaderNodeMath")
-    mask_mul.location = (-350, 520)
+    mask_mul.location = (-300, 580)
     mask_mul.operation = "MULTIPLY"
 
     holo_mask = nodes.new("ShaderNodeMath")
-    holo_mask.location = (-150, 520)
-    holo_mask.operation = "ADD"
-    holo_mask.inputs[1].default_value = 0.08
-    holo_mask.use_clamp = True
+    holo_mask.location = (-100, 580)
+    holo_mask.operation = "POWER"
+    holo_mask.inputs[1].default_value = HOLO_MASK_POWER
 
-    fresnel_mask = nodes.new("ShaderNodeMath")
-    fresnel_mask.location = (0, 300)
-    fresnel_mask.operation = "MULTIPLY"
+    glare_view_x = nodes.new("ShaderNodeMath")
+    glare_view_x.location = (-900, 300)
+    glare_view_x.operation = "MULTIPLY"
+    glare_view_x.inputs[1].default_value = 0.32
+
+    glare_view_y = nodes.new("ShaderNodeMath")
+    glare_view_y.location = (-900, 180)
+    glare_view_y.operation = "MULTIPLY"
+    glare_view_y.inputs[1].default_value = 0.28
+
+    glare_cx = nodes.new("ShaderNodeMath")
+    glare_cx.location = (-700, 300)
+    glare_cx.operation = "ADD"
+    glare_cx.inputs[1].default_value = 0.5
+
+    glare_cy = nodes.new("ShaderNodeMath")
+    glare_cy.location = (-700, 180)
+    glare_cy.operation = "ADD"
+    glare_cy.inputs[1].default_value = 0.58
+
+    glare_dx = nodes.new("ShaderNodeMath")
+    glare_dx.location = (-500, 300)
+    glare_dx.operation = "SUBTRACT"
+
+    glare_dy = nodes.new("ShaderNodeMath")
+    glare_dy.location = (-500, 180)
+    glare_dy.operation = "SUBTRACT"
+
+    glare_vec = nodes.new("ShaderNodeCombineXYZ")
+    glare_vec.location = (-300, 240)
+
+    glare_len = nodes.new("ShaderNodeVectorMath")
+    glare_len.location = (-100, 240)
+    glare_len.operation = "LENGTH"
+
+    glare_falloff = nodes.new("ShaderNodeMapRange")
+    glare_falloff.location = (100, 240)
+    glare_falloff.clamp = True
+    glare_falloff.inputs["From Min"].default_value = 0.0
+    glare_falloff.inputs["From Max"].default_value = 0.38
+    glare_falloff.inputs["To Min"].default_value = 1.0
+    glare_falloff.inputs["To Max"].default_value = 0.0
+
+    glare_tint = nodes.new("ShaderNodeRGB")
+    glare_tint.location = (100, 80)
+    glare_tint.outputs[0].default_value = (0.82, 0.92, 1.0, 1.0)
+
+    glare_scale = nodes.new("ShaderNodeMath")
+    glare_scale.location = (300, 80)
+    glare_scale.operation = "MULTIPLY"
+    glare_scale.inputs[1].default_value = HOLO_GLARE_MIX
+
+    glare_mix = nodes.new("ShaderNodeMix")
+    glare_mix.location = (780, -120)
+    glare_mix.data_type = "RGBA"
+    glare_mix.blend_type = "SCREEN"
+
+    holo_screen = nodes.new("ShaderNodeMix")
+    holo_screen.location = (980, 120)
+    holo_screen.data_type = "RGBA"
+    holo_screen.blend_type = "SCREEN"
+
+    holo_factor = nodes.new("ShaderNodeMath")
+    holo_factor.location = (780, 280)
+    holo_factor.operation = "MULTIPLY"
 
     emission = nodes.new("ShaderNodeEmission")
-    emission.location = (400, 100)
-    emission.inputs["Strength"].default_value = 0.6
+    emission.location = (1100, 80)
+
+    emit_strength = nodes.new("ShaderNodeMath")
+    emit_strength.location = (980, 280)
+    emit_strength.operation = "MULTIPLY"
+    emit_strength.inputs[1].default_value = HOLO_EMISSION_STRENGTH
 
     add_shader = nodes.new("ShaderNodeAddShader")
-    add_shader.location = (650, 200)
+    add_shader.location = (1180, 220)
 
     links.new(tex_coord.outputs["UV"], face_tex.inputs["Vector"])
-    links.new(tex_coord.outputs["UV"], cosmos_tex.inputs["Vector"])
     links.new(tex_coord.outputs["UV"], sep_uv.inputs["Vector"])
     links.new(face_tex.outputs["Color"], principled.inputs["Base Color"])
     links.new(face_tex.outputs["Color"], holo_screen.inputs["B"])
 
-    links.new(sep_uv.outputs["X"], mask_x.inputs["Value"])
-    links.new(sep_uv.outputs["Y"], mask_y.inputs["Value"])
-    links.new(mask_x.outputs["Result"], mask_mul.inputs[0])
-    links.new(mask_y.outputs["Result"], mask_mul.inputs[1])
+    mask_x = _add_axis_mask(
+        nodes, links, sep_uv.outputs["X"], HOLO_UV_X_MIN, HOLO_UV_X_MAX, (-700, 660)
+    )
+    mask_y = _add_axis_mask(
+        nodes, links, sep_uv.outputs["Y"], HOLO_UV_Y_MIN, HOLO_UV_Y_MAX, (-700, 500)
+    )
+    links.new(mask_x.outputs["Value"], mask_mul.inputs[0])
+    links.new(mask_y.outputs["Value"], mask_mul.inputs[1])
     links.new(mask_mul.outputs["Value"], holo_mask.inputs[0])
 
     links.new(geom.outputs["Incoming"], view_neg.inputs[0])
@@ -280,18 +472,44 @@ def create_card_material(rainbow_img, dist_img, face_img, cosmos_img):
     links.new(add_y.outputs["Value"], foil_y.inputs[0])
     links.new(dist_y.outputs["Value"], foil_y.inputs[1])
 
-    links.new(foil_x.outputs["Value"], combine_uv.inputs["X"])
-    links.new(foil_y.outputs["Value"], combine_uv.inputs["Y"])
-    links.new(combine_uv.outputs["Vector"], rainbow_tex.inputs["Vector"])
-    links.new(cosmos_tex.outputs["Color"], foil_mix.inputs["A"])
-    links.new(rainbow_tex.outputs["Color"], foil_mix.inputs["B"])
-    links.new(foil_mix.outputs["Result"], holo_screen.inputs["A"])
-    links.new(layer.outputs["Fresnel"], holo_screen.inputs["Factor"])
+    links.new(sep_view.outputs["X"], glare_view_x.inputs[0])
+    links.new(sep_view.outputs["Y"], glare_view_y.inputs[0])
+    links.new(glare_view_x.outputs["Value"], glare_cx.inputs[0])
+    links.new(glare_view_y.outputs["Value"], glare_cy.inputs[0])
 
-    links.new(layer.outputs["Fresnel"], fresnel_mask.inputs[0])
-    links.new(holo_mask.outputs["Value"], fresnel_mask.inputs[1])
+    links.new(rainbow_uv.outputs["Vector"], rainbow_tex.inputs["Vector"])
+    links.new(bottom_uv.outputs["Vector"], cosmos_bottom_tex.inputs["Vector"])
+    links.new(middle_uv.outputs["Vector"], cosmos_middle_tex.inputs["Vector"])
+
+    links.new(cosmos_bottom_tex.outputs["Color"], bottom_rainbow.inputs["A"])
+    links.new(rainbow_tex.outputs["Color"], bottom_rainbow.inputs["B"])
+    links.new(bottom_rainbow.outputs["Result"], foil_base.inputs["A"])
+    links.new(cosmos_bottom_tex.outputs["Color"], foil_base.inputs["B"])
+    links.new(foil_base.outputs["Result"], foil_mid.inputs["A"])
+    links.new(cosmos_middle_tex.outputs["Color"], foil_mid.inputs["B"])
+
+    links.new(sep_uv.outputs["X"], glare_dx.inputs[0])
+    links.new(glare_cx.outputs["Value"], glare_dx.inputs[1])
+    links.new(sep_uv.outputs["Y"], glare_dy.inputs[0])
+    links.new(glare_cy.outputs["Value"], glare_dy.inputs[1])
+    links.new(glare_dx.outputs["Value"], glare_vec.inputs["X"])
+    links.new(glare_dy.outputs["Value"], glare_vec.inputs["Y"])
+    links.new(glare_vec.outputs["Vector"], glare_len.inputs[0])
+    links.new(glare_len.outputs["Value"], glare_falloff.inputs["Value"])
+    links.new(glare_falloff.outputs["Result"], glare_scale.inputs[0])
+
+    links.new(foil_mid.outputs["Result"], glare_mix.inputs["A"])
+    links.new(glare_tint.outputs["Color"], glare_mix.inputs["B"])
+    links.new(glare_scale.outputs["Value"], glare_mix.inputs["Factor"])
+
+    links.new(glare_mix.outputs["Result"], holo_screen.inputs["A"])
+    links.new(layer.outputs["Fresnel"], holo_factor.inputs[0])
+    links.new(holo_mask.outputs["Value"], holo_factor.inputs[1])
+    links.new(holo_factor.outputs["Value"], holo_screen.inputs["Factor"])
+
+    links.new(holo_factor.outputs["Value"], emit_strength.inputs[0])
     links.new(holo_screen.outputs["Result"], emission.inputs["Color"])
-    links.new(fresnel_mask.outputs["Value"], emission.inputs["Strength"])
+    links.new(emit_strength.outputs["Value"], emission.inputs["Strength"])
 
     links.new(principled.outputs["BSDF"], add_shader.inputs[0])
     links.new(emission.outputs["Emission"], add_shader.inputs[1])
@@ -300,8 +518,7 @@ def create_card_material(rainbow_img, dist_img, face_img, cosmos_img):
 
 
 def create_back_material(back_img):
-    if back_img.pixels[0] == 0.0:
-        back_img.reload()
+    _ensure_image_loaded(back_img)
 
     mat = bpy.data.materials.new("CardBack")
     mat.use_nodes = True
@@ -459,20 +676,8 @@ def point_camera_at(cam, target):
 
 
 def setup_scene(card):
-    bpy.context.scene.render.engine = "BLENDER_EEVEE"
     scene = bpy.context.scene
-    scene.render.resolution_x = 1920
-    scene.render.resolution_y = 1080
-    scene.render.film_transparent = False
-
-    if hasattr(scene, "eevee"):
-        eevee = scene.eevee
-        if hasattr(eevee, "use_bloom"):
-            eevee.use_bloom = True
-        if hasattr(eevee, "bloom_intensity"):
-            eevee.bloom_intensity = 0.04
-        if hasattr(eevee, "bloom_threshold"):
-            eevee.bloom_threshold = 0.85
+    configure_eevee_render(scene, enable_compositor_bloom=True)
 
     world = bpy.data.worlds.new("StudioWorld")
     bpy.context.scene.world = world
@@ -615,10 +820,13 @@ def main():
     rainbow = load_image("Holo_Rainbow", "sRGB")
     distortion = load_image("Holo_Distortion", "Non-Color")
     face = load_image("Charizard_Base_Set", "sRGB")
-    cosmos = load_image("Cosmos_Holo", "sRGB")
+    cosmos_bottom = load_image("Cosmos_Holo", "sRGB")
+    cosmos_middle = load_image_optional("Cosmos_Holo_Middle", "Cosmos_Holo", "sRGB")
     back = load_image("Card_Back", "sRGB")
 
-    front_material = create_card_material(rainbow, distortion, face, cosmos)
+    front_material = create_card_material(
+        rainbow, distortion, face, cosmos_bottom, cosmos_middle
+    )
     back_material = create_back_material(back)
     edge_material = create_edge_material()
     card = create_card_mesh(front_material, back_material, edge_material)
@@ -630,7 +838,7 @@ def main():
     # Annotations for the user
     card["texture_note"] = (
         "Front: Charizard_Base_Set.jpg. Back: Card_Back.png (Pokemon TCG API). "
-        "Cosmos foil: Cosmos_Holo.png."
+        "Cosmos foil: Cosmos_Holo.png + Cosmos_Holo_Middle.png."
     )
 
     bpy.ops.wm.save_as_mainfile(filepath=BLEND_PATH)

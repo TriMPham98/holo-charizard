@@ -7,6 +7,7 @@ def _reload_textures():
         "Charizard_Base_Set",
         "Card_Back",
         "Cosmos_Holo",
+        "Cosmos_Holo_Middle",
         "Holo_Rainbow",
         "Holo_Distortion",
     ):

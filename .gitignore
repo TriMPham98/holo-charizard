@@ -10,6 +10,7 @@ debug_*.png
 test_*.png
 render_preview.png
 user_screenshot*.png
+renders/
 assets/textures/test_write.png
 
 # macOS
