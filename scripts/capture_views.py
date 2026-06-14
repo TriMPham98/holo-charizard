@@ -67,7 +67,7 @@ def render_named_view(name, location, target=None):
     return output_path
 
 
-def render_stress_bright():
+def render_stress_bright(default_location):
     """Catch emission blowout regressions under brighter key lighting."""
     key = bpy.data.objects.get("KeyLight")
     if key is None:
@@ -77,7 +77,7 @@ def render_stress_bright():
     original_energy = key.data.energy
     key.data.energy = original_energy * STRESS_LIGHT_ENERGY_MULTIPLIER
     try:
-        return render_named_view("holo_stress_bright", get_camera().location.copy())
+        return render_named_view("holo_stress_bright", tuple(default_location))
     finally:
         key.data.energy = original_energy
 
@@ -101,7 +101,7 @@ def main():
     for name, location in views:
         rendered.append(render_named_view(name, location))
 
-    stress_path = render_stress_bright()
+    stress_path = render_stress_bright(default_location)
     if stress_path:
         rendered.append(stress_path)
 
