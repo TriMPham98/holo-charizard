@@ -3,7 +3,13 @@ import bpy
 
 
 def _reload_textures():
-    for name in ("Charizard_Base_Set", "Cosmos_Holo", "Holo_Rainbow", "Holo_Distortion"):
+    for name in (
+        "Charizard_Base_Set",
+        "Card_Back",
+        "Cosmos_Holo",
+        "Holo_Rainbow",
+        "Holo_Distortion",
+    ):
         img = bpy.data.images.get(name)
         if img and img.packed_file is None:
             img.reload()

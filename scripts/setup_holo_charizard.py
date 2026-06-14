@@ -112,7 +112,7 @@ def create_card_material(rainbow_img, dist_img, face_img, cosmos_img):
 
     mat = bpy.data.materials.new("HoloCharizardCard")
     mat.use_nodes = True
-    mat.use_backface_culling = False
+    mat.use_backface_culling = True
     mat.diffuse_color = (0.95, 0.78, 0.12, 1.0)
     nodes = mat.node_tree.nodes
     links = mat.node_tree.links
@@ -299,6 +299,58 @@ def create_card_material(rainbow_img, dist_img, face_img, cosmos_img):
     return mat
 
 
+def create_back_material(back_img):
+    if back_img.pixels[0] == 0.0:
+        back_img.reload()
+
+    mat = bpy.data.materials.new("CardBack")
+    mat.use_nodes = True
+    mat.use_backface_culling = True
+    mat.diffuse_color = (0.12, 0.22, 0.55, 1.0)
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+
+    output = nodes.new("ShaderNodeOutputMaterial")
+    output.location = (300, 0)
+
+    tex_coord = nodes.new("ShaderNodeTexCoord")
+    tex_coord.location = (-400, 0)
+
+    back_tex = nodes.new("ShaderNodeTexImage")
+    back_tex.location = (-150, 0)
+    back_tex.image = back_img
+    back_tex.interpolation = "Linear"
+
+    principled = nodes.new("ShaderNodeBsdfPrincipled")
+    principled.location = (100, 0)
+    principled.inputs["Roughness"].default_value = 0.38
+    if "Specular IOR Level" in principled.inputs:
+        principled.inputs["Specular IOR Level"].default_value = 0.35
+
+    links.new(tex_coord.outputs["UV"], back_tex.inputs["Vector"])
+    links.new(back_tex.outputs["Color"], principled.inputs["Base Color"])
+    links.new(principled.outputs["BSDF"], output.inputs["Surface"])
+    return mat
+
+
+def create_edge_material():
+    mat = bpy.data.materials.new("CardEdge")
+    mat.use_nodes = True
+    mat.use_backface_culling = True
+    mat.diffuse_color = (0.06, 0.1, 0.24, 1.0)
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+
+    output = nodes.new("ShaderNodeOutputMaterial")
+    principled = nodes.new("ShaderNodeBsdfPrincipled")
+    principled.inputs["Base Color"].default_value = (0.06, 0.1, 0.24, 1.0)
+    principled.inputs["Roughness"].default_value = 0.55
+    links.new(principled.outputs["BSDF"], output.inputs["Surface"])
+    return mat
+
+
 # ---------------------------------------------------------------------------
 # Geometry
 # ---------------------------------------------------------------------------
@@ -334,41 +386,57 @@ def assign_card_uvs(mesh, half_w=None, half_h=None):
         max_y = max(v.co.y for v in verts)
     span_x = max(max_x - min_x, 1e-6)
     span_y = max(max_y - min_y, 1e-6)
-    for loop in mesh.loops:
-        co = verts[loop.vertex_index].co
-        u = (co.x - min_x) / span_x
-        v = (co.y - min_y) / span_y
-        uv_layer[loop.index].uv = (u, v)
+    for poly in mesh.polygons:
+        flip_u = poly.normal.z < -0.5
+        for loop_index in poly.loop_indices:
+            co = verts[mesh.loops[loop_index].vertex_index].co
+            u = (co.x - min_x) / span_x
+            v = (co.y - min_y) / span_y
+            if flip_u:
+                u = 1.0 - u
+            uv_layer[loop_index].uv = (u, v)
 
 
-def create_card_mesh(material):
+def create_card_mesh(front_material, back_material, edge_material):
     half_w = CARD_WIDTH / 2
     half_h = CARD_HEIGHT / 2
-    z = CARD_THICKNESS / 2
+    half_t = CARD_THICKNESS / 2
 
     bm = bmesh.new()
     outline = rounded_rect_points(
         half_w, half_h, CARD_CORNER_RADIUS, CARD_CORNER_SEGMENTS
     )
-    verts = [bm.verts.new((x, y, z)) for x, y in outline]
+    top_verts = [bm.verts.new((x, y, half_t)) for x, y in outline]
+    bottom_verts = [bm.verts.new((x, y, -half_t)) for x, y in outline]
     bm.verts.ensure_lookup_table()
-    bm.faces.new(verts)
+
+    bm.faces.new(top_verts)
+    bm.faces.new(list(reversed(bottom_verts)))
+    vert_count = len(outline)
+    for i in range(vert_count):
+        j = (i + 1) % vert_count
+        bm.faces.new([top_verts[i], top_verts[j], bottom_verts[j], bottom_verts[i]])
+
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
 
     mesh = bpy.data.meshes.new("HoloCharizardCardMesh")
     bm.to_mesh(mesh)
     bm.free()
     mesh.update()
+    assign_card_uvs(mesh, half_w, half_h)
+
+    for poly in mesh.polygons:
+        if poly.normal.z > 0.5:
+            poly.material_index = 0  # front (Charizard)
+        elif poly.normal.z < -0.5:
+            poly.material_index = 1  # back (Pokéball)
+        else:
+            poly.material_index = 2
 
     card = bpy.data.objects.new("HoloCharizardCard", mesh)
     bpy.context.collection.objects.link(card)
     bpy.context.view_layer.objects.active = card
     card.select_set(True)
-    assign_card_uvs(mesh, half_w, half_h)
-
-    solidify = card.modifiers.new("Solidify", "SOLIDIFY")
-    solidify.thickness = CARD_THICKNESS
-    solidify.offset = 0.0
 
     bevel = card.modifiers.new("Bevel", "BEVEL")
     bevel.width = min(CARD_CORNER_RADIUS * 0.12, CARD_THICKNESS * 0.45)
@@ -376,7 +444,9 @@ def create_card_mesh(material):
     bevel.limit_method = "ANGLE"
     bevel.angle_limit = math.radians(35)
 
-    card.data.materials.append(material)
+    card.data.materials.append(front_material)
+    card.data.materials.append(back_material)
+    card.data.materials.append(edge_material)
     return card
 
 
@@ -546,9 +616,12 @@ def main():
     distortion = load_image("Holo_Distortion", "Non-Color")
     face = load_image("Charizard_Base_Set", "sRGB")
     cosmos = load_image("Cosmos_Holo", "sRGB")
+    back = load_image("Card_Back", "sRGB")
 
-    material = create_card_material(rainbow, distortion, face, cosmos)
-    card = create_card_mesh(material)
+    front_material = create_card_material(rainbow, distortion, face, cosmos)
+    back_material = create_back_material(back)
+    edge_material = create_edge_material()
+    card = create_card_mesh(front_material, back_material, edge_material)
     setup_scene(card)
     configure_workspaces()
     add_helper_scripts()
@@ -556,8 +629,8 @@ def main():
 
     # Annotations for the user
     card["texture_note"] = (
-        "Card face: assets/textures/Charizard_Base_Set.jpg (PkmnCards). "
-        "Cosmos foil: assets/textures/Cosmos_Holo.png (pokemon-cards-css / Simey)."
+        "Front: Charizard_Base_Set.jpg. Back: Card_Back.png (Pokemon TCG API). "
+        "Cosmos foil: Cosmos_Holo.png."
     )
 
     bpy.ops.wm.save_as_mainfile(filepath=BLEND_PATH)
